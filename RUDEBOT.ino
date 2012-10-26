@@ -1,29 +1,12 @@
-// CAVEATS
-// 1) If you don't send data to the client during periods of inactivity, the wifi
-//    library will disconnect. Hence the keepalive code.
-// 2) If you don't send the client actual responses to data that is sent after a very
-//    very short period of time, the wifi library will disconnect.
-// 3) In both cases, if these conditions are met, the wifi library will not allow new
-//    connections to come in. I believe this is a bug!
-
 #include <SPI.h>
 #include <WiFi.h>
 #include "DualMC33926MotorShield.h"
 #include "keys.h"
 
-// Every 60 seconds shoot across a keepalive due to CAVEAT (2)
+// Every 60 seconds shoot across a keepalive
 #define KEEPALIVE 60000
 
 DualMC33926MotorShield md;
-
-void stopIfFault()
-{
-  if (md.getFault())
-  {
-    Serial.println("fault");
-    while(1);
-  }
-}
 
 const char forwardk = 'k';
 const char reversek = 'j';
@@ -180,10 +163,7 @@ void loop() {
         keepalive = millis();
       }
     }
-  } else {
-    //Serial.println("dead client: " + String(client));
-    //Serial.println("server status: " + String(server.status()));
-  }
+  } 
 }
 
 void connectWifi() {
@@ -220,3 +200,11 @@ void printWifiStatus() {
   Serial.println(" dBm");
 }
 
+void stopIfFault()
+{
+  if (md.getFault())
+  {
+    Serial.println("fault");
+    while(1);
+  }
+}
