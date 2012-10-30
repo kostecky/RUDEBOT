@@ -4,11 +4,11 @@
 #include "DualMC33926MotorShield.h"
 #include "keys.h"
 
-// Every 60 seconds shoot across a keepalive
-#define KEEPALIVE 60000
-
 // Every second we run something
 #define CRON 1000
+
+// Disconnect client after our timeout
+#define CLIENTDEAD 15000
 
 // Buffer for our logging function
 #define MAXLOG 64
@@ -44,8 +44,6 @@ const char* bye = "Bye!\r\n";
 
 boolean alreadyConnected = false;
 byte mac[6];
-WiFiClient organic = NULL;
-unsigned long keepalive = millis();
 unsigned long lastc = millis();
 unsigned long lastcron = millis();
 unsigned long lastserver = millis();
@@ -145,11 +143,8 @@ void loop() {
     // Server alive?
     if (server.status() != 1) {
       logger("Server dead: %d\r\n", server.status());      
-      if (client) {
-        killClient();
-        return;
-      }
-      md.setSpeeds(0,0);
+      killClient();
+      return;
     } else {
       // Log it if it's been a while since we were alive
       if ( (millis()-lastserver) > 5000 ) {
@@ -169,6 +164,7 @@ void loop() {
   if (client) {
     // New clients
     if (!alreadyConnected) {
+      lastc = millis();
       logger(hello);
       server.write(hello);
       alreadyConnected = true;
@@ -230,31 +226,31 @@ void loop() {
       // Time of last command
       lastc = millis();
 
-      // If the server doesn't send feedback, the wifi library disconnects. WTF!?
-      // I'd like to remove this, but it could be useful for the client to know when
+      // It's useful for the client to know when
       // an action has executed.
       server.write(c);
     } else { 
+      // Stop the cart after no command received for drivetime
       if (millis() - lastc > drivetime) {
         md.setSpeeds(0,0);
       }
-      // keepalive (annoying!!)
-      if ( (millis() - keepalive) > KEEPALIVE) {
-        if (client)
-          client.flush();
-        server.write(".\r\n");
-        Serial.print("Ping!\r\n");
-        keepalive = millis();
-      }
+      
+      // Disconnect client if no data comes across
+      if (millis() - lastc > CLIENTDEAD) {
+        killClient();
+      }      
     }
   } 
 }
 
 void killClient() {
-  logger(bye);
-  server.write(bye);
-  client.flush();
-  client.stop();
+  md.setSpeeds(0,0);
+  if (client) { 
+    logger(bye);
+    server.write(bye);
+    client.flush();
+    client.stop();
+  }
   alreadyConnected == false;
 }
   
