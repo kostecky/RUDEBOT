@@ -14,7 +14,7 @@ MAX_NECK_LEFT = 30
 MAX_NECK_RIGHT = 140
 MOVE_COMMAND_DELAY = 0.1
 TICK_SLEEP = 10   # milliseconds
-BAIL_TIMEOUT = 1000   # milliseconds - how long to wait for network ACK before assuming connection is dead
+BAIL_TIMEOUT = 500   # milliseconds - how long to wait for network ACK before assuming connection is dead
 I_SLEEP_INIT = 10   # milliseconds - initial value for networking loop sleep...
 NECK_ADDY = ('192.168.20.127', 7777)
 ROVER_ADDY = ('192.168.20.128', 8888)
@@ -51,6 +51,8 @@ SIXAXIS_MAP = {
 six = None
 neck = None
 rover = None
+surface = None
+turtle = [400,300]
 
 
 def debug(msg):
@@ -59,7 +61,7 @@ def debug(msg):
 
 
 def init_pygame():
-    global six
+    global six, surface
 
     pygame.init()
 
@@ -82,6 +84,10 @@ def init_pygame():
 
     pygame.display.init()
     pygame.display.set_mode((800,600))
+    surface = pygame.display.get_surface()
+    pygame.draw.polygon(surface, pygame.Color('#00FF00FF'), [(400, 300), (500, 300), (450, 213.4)])
+    pygame.draw.polygon(surface, pygame.Color('#FF0000FF'), [(425, 256.7), (475, 256.7), (450, 213.4)])
+    pygame.display.flip()
 
 
 def socket_kill(sock, preshutdown_msg=None):
@@ -162,8 +168,8 @@ def neck_connect():
 
 
 def neck_cmd(cmd):
+    #neck_get()
     neck_send(cmd)
-    neck_get()
 
 
 def rover_send(msg, do_reconnect=True):
@@ -228,21 +234,6 @@ def neck_get(do_reconnect=True):
     return buf
 
 
-neck_connect()
-rover_reconnect()
-
-init_pygame()
-
-last = {
-  'f': 0,
-  'b': 0,
-  'l': 0,
-  'r': 0,
-}
-
-neck_cmd('90')
-neck_pos = 90
-
 def move_neck_right(amt=20):
     global neck_pos
 
@@ -263,6 +254,21 @@ def move_neck_left(amt=20):
 
     neck_cmd(str(neck_pos))
   
+
+#neck_connect()
+#rover_reconnect()
+
+init_pygame()
+
+last = {
+  'f': 0,
+  'b': 0,
+  'l': 0,
+  'r': 0,
+}
+
+neck_cmd('90')
+neck_pos = 90
 
 last_keepalive = time.time()
 last_move_cmd = ''
