@@ -167,6 +167,7 @@ void loop() {
       lastc = millis();
       logger(hello);
       server.write(hello);
+      speed = 100;
       alreadyConnected = true;
       client.flush();
     }
@@ -240,7 +241,10 @@ void loop() {
         killClient();
       }      
     }
-  } 
+  } else { 
+    // Safety - client disappears, robot stops. This prevents the robot from trying to kill Anarosa.
+    md.setSpeeds(0,0);
+  }
 }
 
 void killClient() {
