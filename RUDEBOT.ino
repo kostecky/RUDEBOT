@@ -409,6 +409,7 @@ void loop() {
           
         // Motors wired in reverse (compensate here)
         md.setSpeeds(-m1speed, -m2speed);
+        // reset command
         memset(cmdC, NULL, 10);
   
         // Time of last command
