@@ -15,10 +15,13 @@
 #define CLIENTDEAD 15000
 
 // Buffer for our logging function
-#define MAXLOG 64
+#define BUFLEN 64
 
 // Restart server interval?
 #define SERVER 30000
+
+// Length of the client mode command
+#define CMDLEN 10
 
 DualMC33926MotorShield md;
 
@@ -58,8 +61,11 @@ int speed = 100;
 // Mode is (S)ocket or (C)lient
 char mode = 'S';
 // [+/-]123\0[+/-]321\n
-char cmdC[10] = {};
-int cmdPos = 0;
+char cmdC[CMDLEN] = {};
+char cbuf[BUFLEN] = {};
+int bAvail = 0;
+int bRead = 0;
+
 int status = WL_IDLE_STATUS;
 // How many milliseconds do we drive for in between commands? 2/3 of a second naturally. This is a good balance between network latency, tcp/ip buffering (even with TCP_NODELAY), and natural controls.
 int thrust_drivetime = 666;
@@ -75,17 +81,17 @@ WiFiServer server(8888);
 File logFile;
 
 void logger(const char *fmt, ...) {
-  char buffer[MAXLOG];
-  char timebuffer[MAXLOG];
-  memset(buffer, '\0', MAXLOG);
-  memset(timebuffer, '\0', MAXLOG);
+  char buffer[BUFLEN];
+  char timebuffer[BUFLEN];
+  memset(buffer, '\0', BUFLEN);
+  memset(timebuffer, '\0', BUFLEN);
   va_list args;
   va_start (args, fmt);
-  vsnprintf(buffer, MAXLOG-1, fmt, args);
+  vsnprintf(buffer, BUFLEN-1, fmt, args);
   va_end (args);
 
   // timestamp
-  snprintf(timebuffer, MAXLOG-1, "%ld - %s", millis(), buffer);
+  snprintf(timebuffer, BUFLEN-1, "%ld - %s", millis(), buffer);
 
   Serial.print(timebuffer);
 
@@ -167,7 +173,7 @@ void setup() {
   }
   client = NULL;
 
-  char response[MAXLOG];
+  char response[BUFLEN];
   int pos = 0;
   time_t nowTime = 0;
   // Wait 5 seconds
@@ -204,16 +210,8 @@ void setup() {
 }
 
 void loop() {
-  // listen for incoming clients
+  // Any clients?
   client = server.available();
-
-  // Reset already connected if someone dropped
-  if (((alreadyConnected == true) && !client) || 
-      ((alreadyConnected == true) && client && client.status() != 4)) {
-    alreadyConnected = false;
-    // Heart stopped
-//    digitalWrite(0, LOW);
-  }
     
   // Heartbeat (Every quarter second)  
 /*
@@ -236,8 +234,6 @@ void loop() {
   if ( (millis() - lastcron) > CRON) {
     logger(ramString, freeRam());
     printWifiStatus();
-//    logger(signalString, WiFi.RSSI());
-//    logger(serverString, server.status());
     int m1 = md.getM1CurrentMilliamps();
     int m2 = md.getM2CurrentMilliamps();
     if ( m1 > m1MaxCurrent) {
@@ -281,15 +277,21 @@ void loop() {
       lastc = millis();
       logger(hello);
       server.write(hello);
+      // reset everything
+      md.setSpeeds(0,0);
       speed = 100;
+      memset(cmdC, NULL, 10);
       alreadyConnected = true;
       mode = 'S';
       client.flush();
     }
 
-    if (client.available()) {
+    // We can switch to "C"lient mode from "S"ocket mode, but not back, unless you reconnect.
+    if ((mode == 'S') && (client.available())) {
       char c = client.read();
-      // Debugging
+
+      // Debugging - not needed, maybe for client mode.
+      /*
       if ( c == NULL ) {
         logger("'c: NULL'\r\n", c);
       } else if ( c == '\n' ) {
@@ -297,127 +299,136 @@ void loop() {
       } else {
         logger("'c: %c'\r\n", c);
       }
-      
-      // switch modes on the fly no matter where we're at.
+      */
+
       switch(c) {
-        case 'S':
-          mode = 'S';
-          logger("Changed to socket mode\r\n");
-          return;
-          break;
         case 'C':
           mode = 'C';
           logger("Changed to client mode\r\n");
+          drivetime = 666;
           return;
           break;
         case disconnect:
           killClient();
           return;        
           break;
+        case forwardk:
+        case forwardk2:
+          drivetime = thrust_drivetime;
+          md.setSpeeds(-speed,-speed);          
+          break;
+        case reversek:
+        case reversek2:
+          drivetime = thrust_drivetime;
+          // Speed going in reverse is always 100 - Prevent wheelies
+          md.setSpeeds(100,100);
+          break;
+        case leftk:
+        case leftk2:
+          drivetime = yaw_drivetime;
+          md.setSpeeds(-speed,speed);
+          break;
+        case rightk:
+        case rightk2:
+          drivetime = yaw_drivetime;
+          md.setSpeeds(speed,-speed);
+          break;
+        case stop:
+          md.setSpeeds(0,0);
+          break;
+        case '1':
+          speed = 100;
+          thrust_drivetime = 600;
+          yaw_drivetime = 300;
+          break;
+        case '2':
+          speed = 133;
+          thrust_drivetime = 533;
+          yaw_drivetime = 266;
+          break;
+        case '3':
+          speed = 166;
+          thrust_drivetime = 466;
+          yaw_drivetime = 233;
+          break;
+        case '4':
+          speed = 200;
+          thrust_drivetime = 400;
+          yaw_drivetime = 200;
+          break;
       }
-      
-      // Socket mode
-      if (mode == 'S') {
-        switch (c) {
-          case forwardk:
-          case forwardk2:
-            drivetime = thrust_drivetime;
-            md.setSpeeds(-speed,-speed);          
-            break;
-          case reversek:
-          case reversek2:
-            drivetime = thrust_drivetime;
-            // Speed going in reverse is always 100 - Prevent wheelies
-            md.setSpeeds(100,100);
-            break;
-          case leftk:
-          case leftk2:
-            drivetime = yaw_drivetime;
-            md.setSpeeds(-speed,speed);
-            break;
-          case rightk:
-          case rightk2:
-            drivetime = yaw_drivetime;
-            md.setSpeeds(speed,-speed);
-            break;
-          case stop:
-            md.setSpeeds(0,0);
-            break;
-          case '1':
-            speed = 100;
-            thrust_drivetime = 600;
-            yaw_drivetime = 300;
-            break;
-          case '2':
-            speed = 133;
-            thrust_drivetime = 533;
-            yaw_drivetime = 266;
-            break;
-          case '3':
-            speed = 166;
-            thrust_drivetime = 466;
-            yaw_drivetime = 233;
-            break;
-          case '4':
-            speed = 200;
-            thrust_drivetime = 400;
-            yaw_drivetime = 200;
-            break;
+      // Time of last command
+      lastc = millis();
+      // It's useful for the client to know when
+      // an action has executed.
+      server.write(c);
+      logger("'%c'\r\n", c);
+    }
+
+    // Client mode - Independent control of motors
+    if ((mode == 'C') && (bAvail = client.available()) && (bAvail >= CMDLEN)) {      
+      // Debugging
+      logger("Bytes Available: %d", bAvail);
+      // OK, we probably have at least a command, we only care about the last full command.
+      // Defaults to 1000ms timeout waiting on read buffer
+      //client.setTimeout(1000);
+      while (bAvail >= CMDLEN) {
+        bRead = client.readBytesUntil('\n', cmdC, 10);
+        if ((cmdC[9] == '\n') && (bRead == 10)) {
+          // Most likely a good command
+          cmdC[9] = NULL;
+          // Disconnect?
+          if (cmdC[0] == disconnect) {
+            killClient();
+            return;
+          }
+        } else {
+          // else, command is screwed or not all there, read again if there is at least CMDLen left.
+          // We're not super-concerned about partial reads. Best be fast and dirty, rather than picky
+          // as so many commands are coming in when in motion.
+          memset(cmdC, NULL, 10);
         }
+        bAvail -= bRead;
+      }
+            
+      if (cmdC) {        
+        int m1speed = atoi(cmdC);
+        int m2speed = atoi(cmdC+5);
+        if (m1speed >= 200) {
+          m1speed = 200;
+        }
+        if (m1speed <= -200) {
+          m1speed = -200;
+        }
+        if (m2speed >= 200) {
+          m2speed = 200;
+        }
+        if (m2speed <= -200) {
+          m2speed = -200;
+        }
+          
+        // Motors wired in reverse (compensate here)
+        md.setSpeeds(-m1speed, -m2speed);
+        memset(cmdC, NULL, 10);
+  
         // Time of last command
         lastc = millis();
-        // It's useful for the client to know when
-        // an action has executed.
-        server.write(c);
-        logger("'%c'\r\n", c);
-      } else if ( mode == 'C' ) {
-        // Client mode - Independent control of motors
-        cmdC[cmdPos] = c;
-        if ((c == '\n') || (cmdPos >= 9)) {
-          cmdC[cmdPos] = NULL;
-          int m1speed = atoi(cmdC);
-          int m2speed = atoi(cmdC+5);
-          if (m1speed >= 200) {
-            m1speed = 200;
-          }
-          if (m1speed <= -200) {
-            m1speed = -200;
-          }
-          if (m2speed >= 200) {
-            m2speed = 200;
-          }
-          if (m2speed <= -200) {
-            m2speed = -200;
-          }
-          
-          drivetime = 666;
-          // Motors wired in reverse (fixed here)
-          md.setSpeeds(-m1speed, -m2speed);
-          cmdPos = 0;
-          memset(cmdC, NULL, 9);
-  
-          // Time of last command
-          lastc = millis();
-          logger("cmd: %d|%d\r\n", *cmdC, *(cmdC+5), m1speed, m2speed);
-        } else {
-          cmdPos++;
-        }
-      }    
-
-    } else { 
-      // Stop the cart after no command received for drivetime
-      if (millis() - lastc > drivetime) {
-        md.setSpeeds(0,0);
+        logger("cmd: %d|%d\r\n", *cmdC, *(cmdC+5), m1speed, m2speed);
       }
-      
-      // Disconnect client if no data comes across
-      if (millis() - lastc > CLIENTDEAD) {
-        killClient();
-      }      
+    }    
+
+    // Stop the cart after no command received for drivetime
+    if (millis() - lastc > drivetime) {
+      md.setSpeeds(0,0);
     }
+      
+    // Disconnect client if no data comes across in CLIENTDEAD ms
+    if (millis() - lastc > CLIENTDEAD) {
+      killClient();
+    }          
   } else { 
     // Safety - client disappears, robot stops. This prevents the robot from trying to kill Anarosa.
-    md.setSpeeds(0,0);
+    killClient();
   }
 }
 
@@ -430,6 +441,8 @@ void killClient() {
     client.stop();
   }
   alreadyConnected == false;
+  // Heart stopped
+  //digiitalWrite(0, LOW);
 }
   
 void connectWifi() {
@@ -447,6 +460,9 @@ void connectWifi() {
 void printWifiStatus() {
   // Firmware version?
   // Serial.println("Firmware Version: " + String(WiFi.firmwareVersion()));
+  
+  // How's our power source doing?
+  logger("Battery voltage: %ld\r\n", readVcc());
   
   // print the SSID of the network you're attached to:
   logger("SSID: %s\r\n", WiFi.SSID());
@@ -473,4 +489,31 @@ void stopIfFault()
     logger("Motor fault\r\n");
     while(1);
   }
+}
+
+// Very roughly check on the battery =D
+long readVcc() {
+  // Read 1.1V reference against AVcc
+  // set the reference to Vcc and the measurement to the internal 1.1V reference
+  #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+    ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+    ADMUX = _BV(MUX5) | _BV(MUX0);
+  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+    ADMUX = _BV(MUX3) | _BV(MUX2);
+  #else
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #endif  
+ 
+  delay(2); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA,ADSC)); // measuring
+ 
+  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH  
+  uint8_t high = ADCH; // unlocks both
+ 
+  long result = (high<<8) | low;
+ 
+  result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
+  return result; // Vcc in millivolts
 }
