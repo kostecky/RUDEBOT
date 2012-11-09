@@ -109,7 +109,7 @@ void setup() {
 //  digitalWrite(0, LOW);
   
   //Initialize serial and wait for port to open:
-  Serial.begin(9600); 
+  Serial.begin(115200); 
   while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
   }
@@ -213,6 +213,12 @@ void loop() {
   // Any clients?
   client = server.available();
     
+  // Reset already connected if someone dropped
+  if (((alreadyConnected == true) && !client) || 
+      ((alreadyConnected == true) && client && client.status() != 4)) {
+    alreadyConnected = false;
+  }
+
   // Heartbeat (Every quarter second)  
 /*
   if ( (millis() - lastbeat) > HEARTBEAT ) {
@@ -275,7 +281,6 @@ void loop() {
     // New clients
     if (!alreadyConnected) {
       lastc = millis();
-      logger(hello);
       server.write(hello);
       // reset everything
       md.setSpeeds(0,0);
@@ -284,6 +289,7 @@ void loop() {
       alreadyConnected = true;
       mode = 'S';
       client.flush();
+      logger(hello);
     }
 
     // We can switch to "C"lient mode from "S"ocket mode, but not back, unless you reconnect.
@@ -305,6 +311,7 @@ void loop() {
         case 'C':
           mode = 'C';
           logger("Changed to client mode\r\n");
+          server.write("C\r\n");
           drivetime = 666;
           return;
           break;
@@ -366,15 +373,21 @@ void loop() {
     }
 
     // Client mode - Independent control of motors
-    if ((mode == 'C') && (bAvail = client.available()) && (bAvail >= CMDLEN)) {      
+    if ((mode == 'C') && (bAvail = client.available())) {      
+      // WifiShield libs/firmware only ever return 1 byte if any data is available.
+      // This is very frustrating and shortsighted. Issue has been submitted. How do
+      // we compensate?    
+
       // Debugging
-      logger("Bytes Available: %d", bAvail);
+      logger("Bytes Available: %d\r\n", bAvail);
       // OK, we probably have at least a command, we only care about the last full command.
       // Defaults to 1000ms timeout waiting on read buffer
-      //client.setTimeout(1000);
-      while (bAvail >= CMDLEN) {
+      client.setTimeout(10);
+      while (bAvail = client.available()) {
         bRead = client.readBytesUntil('\n', cmdC, 10);
-        if ((cmdC[9] == '\n') && (bRead == 10)) {
+        logger("Bytes Read: %d %s %s\r\n", bRead, cmdC, cmdC+5);
+        if ((bRead == 9)) {
+          logger("Good Command\r\n");
           // Most likely a good command
           cmdC[9] = NULL;
           // Disconnect?
@@ -382,16 +395,19 @@ void loop() {
             killClient();
             return;
           }
+          if ((millis() - lastc) > 1) {
+            break;
+          }
         } else {
           // else, command is screwed or not all there, read again if there is at least CMDLen left.
           // We're not super-concerned about partial reads. Best be fast and dirty, rather than picky
           // as so many commands are coming in when in motion.
           memset(cmdC, NULL, 10);
         }
-        bAvail -= bRead;
+        //bAvail -= bRead;
       }
             
-      if (cmdC) {        
+      if (bRead) {        
         int m1speed = atoi(cmdC);
         int m2speed = atoi(cmdC+5);
         if (m1speed >= 200) {
@@ -414,7 +430,8 @@ void loop() {
   
         // Time of last command
         lastc = millis();
-        logger("cmd: %d|%d\r\n", *cmdC, *(cmdC+5), m1speed, m2speed);
+        server.write("C\r\n");
+        logger("cmd: %d|%d\r\n", m1speed, m2speed);
       }
     }    
 
