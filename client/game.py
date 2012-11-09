@@ -277,9 +277,6 @@ def rover_cmd(cmd):
 for name in socket_defs:
     socket_reconnect(name)
 
-socket_send('rover', '+050\0+050\n')
-sys.exit(0)
-    
 init_pygame()
 
 while True:
