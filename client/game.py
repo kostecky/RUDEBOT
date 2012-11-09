@@ -14,10 +14,10 @@ DEBUG = True
 MAX_NECK_LEFT = 30
 MAX_NECK_RIGHT = 140
 NECK_INCREMENT_DEGREES = 5
-MOVE_COMMAND_DELAY = 0.1
-BUTTON_REPEAT_DELAY = 0.1
-FLIP_MODE_REPEAT_DELAY = 1
+BUTTON_REPEAT_DELAY = 0.05
 I_DRIVE_REPEAT_DELAY = 0.02
+NAIVE_MOVE_SPEED = '050'
+NAIVE_HALF_SPEED = '025'
 TICK_SLEEP = 10   # milliseconds
 BAIL_TIMEOUT = 500   # milliseconds - how long to wait for network ACK before assuming connection is dead
 I_SLEEP_INIT = 10   # milliseconds - initial value for networking loop sleep...
@@ -52,26 +52,25 @@ SIXAXIS_MAP = {
 }
 
 six = None
-# elements are "name": ((host, port), preshutdown_msg, greeting_msg, ready_marker, keepalive)
-socket_defs = {'neck': (NECK_ADDY, None, ' ', 'pos:', ' '), 'rover': (ROVER_ADDY, '\\', 'C', 'C', None))
+last_buttons = {}
+for k in SIXAXIS_MAP['buttons']:
+    last_buttons[k] = 0
+last_axes = {}
+for k in SIXAXIS_MAP['axes']:
+    last_axes[k] = 0
+
+# elements are "name": ((host, port), preshutdown_msg, greeting_msg, keepalive, 'greeting_msg_to_wait_before_sending_our_greeting')
+socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None), 'rover': (ROVER_ADDY, '\\', 'C', None, 'Hello')}
 sockets = {}
+last_keepalive = time.time()
+
 surface = None
 # Unused as of yet...
 turtle_pos = [400,300]
 
-last = {
-  'f': 0,
-  'b': 0,
-  'l': 0,
-  'r': 0,
-  'select': 0,
-  'sq': 0,
-  'cir': 0,
-  'i_left': 0,   # independent_drive left axis
-  'i_right': 0,   # independent_drive right axis
-}
+neck_pos = 90   # For display/info purposes only
 
-neck_pos = 90
+rover_moving = False   # Detect release of controls and trigger a single explicit 'stop' command immediately
 
 
 def zero_pad(msg, size=3):
@@ -79,6 +78,36 @@ def zero_pad(msg, size=3):
         msg = '0%s' % msg
 
     return msg
+
+def bready(name, now):
+    if (now - last_buttons[name]) > BUTTON_REPEAT_DELAY and six.get_button(SIXAXIS_MAP['buttons'][name]):
+        last_buttons[name] = now
+
+        return True
+
+    return False
+
+def aready(name, now):
+    if (now - last_axes[name]) > I_DRIVE_REPEAT_DELAY and 0.1 <= abs(geta(name)):
+        last_axes[name] = now
+
+        return True
+
+    return False
+
+def getb(name):
+    return six.get_button(SIXAXIS_MAP['buttons'][name])
+
+def geta(name):
+    return six.get_axis(SIXAXIS_MAP['axes'][name])
+
+def stop_i_drive():
+    global rover_moving
+
+    if rover_moving:
+        rover_moving = False
+
+        rover_cmd('+000\0+000\n')
 
 def debug(msg):
     if DEBUG:
@@ -149,23 +178,37 @@ def socket_reconnect(name):
     sockets[name] = create_connection(name)
 
     if socket_defs[name][2] is not None:
+        if socket_defs[name][4]is not None:
+            buf = ''
+            start = time.time()
+            while 0 > buf.find(socket_defs[name][4]):
+                try:
+                    buf = '%s%s' % (buf, sockets[name].recv(1024))
+                except Exception, e:
+                    pass
+
+                if (time.time() - start) > BAIL_TIMEOUT:
+                    raise Exception('Could not connect to server for socket "%s"' % name)
+
+                time.sleep(0.01)
+
         socket_send(name, socket_defs[name][2])
 
 def create_connection(name):
-    socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     debug('Connecting to socket %s' % name)
     debug('Connecting to %s:%s' % socket_defs[name][0])
 
-    socket.connect(socket_defs[name][0])
+    sock.connect(socket_defs[name][0])
 
-    debug('%s:%s - fileno: %s' % (socket_defs[name][0][0], socket_defs[name][0][1], socket.fileno()))
-    debug('setting socket options for %s' % socket.fileno())
+    debug('%s:%s - fileno: %s' % (socket_defs[name][0][0], socket_defs[name][0][1], sock.fileno()))
+    debug('setting socket options for %s' % sock.fileno())
 
-    socket.setblocking(0)
-    socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setblocking(0)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    return socket
+    return sock
 
 def socket_send(name, msg, rescue=True):
     debug('M:%s:%s:%s' % (name, time.time(), msg))
@@ -175,7 +218,7 @@ def socket_send(name, msg, rescue=True):
 
     try:
         sockets[name].sendall(msg)
-    except Exception e:
+    except Exception, e:
         if rescue:
             socket_reconnect(name)
 
@@ -183,52 +226,29 @@ def socket_send(name, msg, rescue=True):
         else:
             raise e
 
-def socket_get(name, expect=None):
-    start = time.time()
-    i_sleep = I_SLEEP_INIT
+def socket_get(name):
     buf = ''
 
-    while 0 > buf.find(expect):
-        try:
-            res = sockets[name].recv(1024)
-            # Slurp whatever's waiting in the socket...
-            while len(res) == 1024:
-                buf = '%s%s' % (buf, res)
-                res = sockets[name].recv(1024)
-
-        except Exception, e:
-            pass   # Ignore recv fails on non-blocking socket!
-
-        if ((time.time() - start) * 1000) > BAIL_TIMEOUT:
-            break
-
-        time.sleep(i_sleep / 1000.0)
-
-        debug('"get" slept for %s milliseconds total (socket: %s)' % (i_sleep, name))
-
-        i_sleep += I_SLEEP_INIT
+    try:
+        buf = sockets[name].recv(1024)
+    except Exception, e:
+        pass   # exceptions for nonblocking sockets are expected
 
     debug('socket "%s" received: %s' % (name, buf))
 
     return buf
 
-def socket_cmd(name, cmd, recon=True):
-    res = socket_get(name, socket_defs[name][3])
+def socket_cmd(name, cmd):
+    res = socket_get(name)
 
-    if 0 > res.find(socket_defs[name][3]):
-        if recon:
-            socket_reconnect(name)
+    socket_send(name, cmd)
 
-            return socket_cmd(name, cmd, recon=False)
-        else:
-            raise Exception('Could not retrieve buffer containing "ready" flag for socket "%s"' % name)
-    else:
-        socket_send(cmd)
+    debug('Sent %s to "%s"' % (cmd, name))
 
     return res
         
 
-def neck_cmd(cmd):
+def neck_cmd(cmd, timeout=BAIL_TIMEOUT):
     global neck_pos
 
     change = NECK_INCREMENT_DEGREES
@@ -237,233 +257,127 @@ def neck_cmd(cmd):
 
     last_pos = socket_cmd('neck', cmd)
 
-    expr1 = re.compile('.*pos: ', flags=(re.DOTALL|re.MULTILINE))
-    expr2 = re.compile('\n.*', flags=(re.DOTALL|re.MULTILINE))
-    pos = re.sub(expr2, '', re.sub(expr1, '', last_pos))
+    if re.search('pos: [0-9]{1,3}\n', last_pos):
+        expr1 = re.compile('.*pos: ', flags=(re.DOTALL|re.MULTILINE))
+        expr2 = re.compile('\n.*', flags=(re.DOTALL|re.MULTILINE))
+        last_pos = re.sub(expr2, '', re.sub(expr1, '', last_pos))
 
-    last_pos += change
-    if last_pos < MAX_NECK_LEFT or last_pos > MAX_NECK_RIGHT:
-        last_pos -= change
-    neck_pos = last_pos
+        last_pos = int(last_pos) + change
+        if last_pos < MAX_NECK_LEFT or last_pos > MAX_NECK_RIGHT:
+            last_pos -= change
+        neck_pos = last_pos
 
-    debug('final last neck position (current): %s' % neck_pos)
+        debug('final last neck position (current): %s' % neck_pos)
 
 
 def rover_cmd(cmd):
     socket_cmd('rover', cmd)
 
 
-# Compound/secondary commands/etc
-def move_neck_right(amt=20):
-    global neck_pos
+for name in socket_defs:
+    socket_reconnect(name)
 
-    neck_pos += amt
-
-    if neck_pos > MAX_NECK_RIGHT:
-        neck_pos = MAX_NECK_RIGHT
-
-    neck_cmd(str(neck_pos))
-
-def move_neck_left(amt=20):
-    global neck_pos
-
-    neck_pos -= amt
-
-    if neck_pos < MAX_NECK_LEFT:
-        neck_pos = MAX_NECK_LEFT
-
-    neck_cmd(str(neck_pos))
-  
-
-for def in socket_defs:
-    socket_reconnect(def)
+socket_send('rover', '+050\0+050\n')
+sys.exit(0)
     
 init_pygame()
 
-
-# HERE
-
-
-last_keepalive = time.time()
-last_move_cmd = ''
-
 while True:
+    # Frame sleep (remove/play with this to speed up the client overall)
     time.sleep(TICK_SLEEP / 1000.0)
 
+    # Send keepalives...
     if (time.time() - last_keepalive) > 1.0:
-        # Send rover connection keepalive...
-        rover_send(' ')
+        for name in sockets:
+            if socket_defs[name][3] is not None:
+                socket_send(name, socket_defs[name][3])
+
         last_keepalive = time.time()
 
+    # Process events
     pygame.event.pump()
 
-    if 1 == six.get_button(SIXAXIS_MAP['buttons']['playstation']):
-        break   # PS button == exit
-
+    # Frame timestamp
     now = time.time()
 
+    # Process input
 
-    if six.get_button(SIXAXIS_MAP['buttons']['select']) and (now - last['select']) > FLIP_MODE_REPEAT_DELAY:
-        last['select'] = now
+    ### Control mapping:
+    ###
+    ### PS button => quit/exit client
+    ### d pad => naive drive mode for rover (forward/reverse/turn left/turn right)
+    ### bottom triggers => move neck left/right
+    ### analog sticks, Y axes => independent drive (run left & right motors in forward/reverse)
 
-        flip_mode()
+    if bready('playstation', now):
+        break   # PS button == exit/quit
 
-    if six.get_button(SIXAXIS_MAP['buttons']['cir']) and (now - last['cir']) > BUTTON_REPEAT_DELAY:
-        last['cir'] = now
+    # neck
+    if bready('l_trigger_bottom', now) or bready('r_trigger_bottom', now):
+        if getb('l_trigger_bottom'):
+            neck_cmd('a')
+        else:
+            neck_cmd('d')
+            
+    # rover - analog sticks (independent drive mode)
 
-        move_neck_right()
+   # send explicit stop if sticks are untouched
+    if not aready('left_y', now) and not aready('right_y', now):
+        stop_i_drive()
 
-    elif six.get_button(SIXAXIS_MAP['buttons']['sq']) and (now - last['sq']) > BUTTON_REPEAT_DELAY:
-        last['sq'] = now
+    # analog sticks take precedence over d-pad...
+    if aready('left_y', now) or aready('right_y', now):
+        left_y = geta('left_y')
+        if abs(left_y) < 0.1:
+            left_y = 0
 
-        move_neck_left()
+        right_y = geta('right_y')
+        if abs(right_y) < 0.1:
+            right_y = 0
 
-    else:
-        neck = six.get_axis(SIXAXIS_MAP['axes']['right_x'])
-        if abs(neck) > 0.1:
-            if 0 < neck:
-                # turn head right
-                move = neck_pos + 10
-    
-                if neck > 0.75:
-                    move += 35
-                elif neck > 0.5:
-                    move += 20
-                elif neck > 0.25:
-                    move += 10
-    
-                if move > MAX_NECK_RIGHT:
-                    move = MAX_NECK_RIGHT
-    
-                neck_cmd(str(move))
-                neck_pos = move
+        cmd_left = '%s\0' % (zero_pad(abs(int(geta('right_y') * 200))))
+        cmd_right = '%s\n' % (zero_pad(abs(int(geta('left_y') * 200))))
+
+        if right_y < 0:
+            cmd_left = '-%s' % cmd_left
+        else:
+            cmd_left = '+%s' % cmd_left
+
+        if left_y < 0:
+            cmd_right = '-%s' % cmd_right
+        else:
+            cmd_right = '+%s' % cmd_right
+
+        cmd = '%s%s' % (cmd_left, cmd_right)
+
+        rover_cmd(cmd)
+
+    # naive drive mode (using d-pad) - turns take precedence (no 'diagonal' controls right now)
+
+    # turn (or "diagonal" (advancing turn))
+    elif bready('left', now) or bready('right', now):
+        if getb('left'):
+            if getb('up'):
+                rover_cmd('+%s\0+%s\n' % (NAIVE_MOVE_SPEED, NAIVE_HALF_SPEED))
+            elif getb('down'):
+                rover_cmd('-%s\0-%s\n' % (NAIVE_MOVE_SPEED, NAIVE_HALF_SPEED))
             else:
-                # turn head left
-                move = neck_pos - 10
-    
-                if neck < -0.75:
-                    move -= 35
-                elif neck < -0.5:
-                    move -= 20
-                elif neck < -0.25:
-                    move -= 10
-    
-                if move < MAX_NECK_LEFT:
-                    move = MAX_NECK_LEFT
-    
-                neck_cmd(str(move))
-                neck_pos = move
-
-    if mode == 'independent_drive':
-        left = six.get_axis(SIXAXIS_MAP['axes']['left_y']) * -1.0
-        right = six.get_axis(SIXAXIS_MAP['axes']['right_y']) * -1.0
-
-        # X and Y (left and right) are swapped motor-wise right now, ie: the first/left parameter in the command controls the right motor
-        # As such, ''cmd_str_left'' below is the first half of the command string, and controls the right motor
-        cmd_str_left = '+000\0'
-        cmd_str_right = '+000\n'
-        queued = False
-
-        if abs(left) > 0.1 and (now - last['i_left']) > I_DRIVE_REPEAT_DELAY:
-            last['i_left'] = now
-            queued = True
-
-            cmd_str_right = '%s\n' % zero_pad(str(int(abs(left) * 200)))
-
-            if 0 > left:
-                cmd_str_right = '-%s' % cmd_str_right
+                rover_cmd('+%s\0-%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
+        else:
+            if getb('up'):
+                rover_cmd('+%s\0+%s\n' % (NAIVE_HALF_SPEED, NAIVE_MOVE_SPEED))
+            elif getb('down'):
+                rover_cmd('-%s\0-%s\n' % (NAIVE_HALF_SPEED, NAIVE_MOVE_SPEED))
             else:
-                cmd_str_right = '+%s' % cmd_str_right
+                rover_cmd('-%s\0+%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
 
-        if abs(right) > 0.1 and (now - last['i_right']) > I_DRIVE_REPEAT_DELAY:
-            last['i_right'] = now
-            queued = True
-
-            cmd_str_left = '%s\n' % zero_pad(str(int(abs(right) * 200)))
-
-            if 0 > right:
-                cmd_str_left = '-%s' % cmd_str_left
-            else:
-                cmd_str_left = '+%s' % cmd_str_left
-
-        if queued:
-            cmd_str = '%s%s' % (cmd_str_left, cmd_str_right)
-
-            #print(cmd_str)   # Debugging
-            rover_send(cmd_str)
-    else:
-        turn = six.get_axis(SIXAXIS_MAP['axes']['left_x'])
-        if six.get_button(SIXAXIS_MAP['buttons']['left']):
-            turn = -0.3
-        elif six.get_button(SIXAXIS_MAP['buttons']['right']):
-            turn = 0.3
-
-        dir = six.get_axis(SIXAXIS_MAP['axes']['left_y']) * -1.0
-        if six.get_button(SIXAXIS_MAP['buttons']['up']):
-            dir = 0.3
-        elif six.get_button(SIXAXIS_MAP['buttons']['down']):
-            dir = -0.3
-
-        if abs(turn) > 0.1:
-            now = time.time()
-    
-            speed = 1
-    
-            if abs(turn) > 0.75:
-                speed = 4
-            elif abs(turn) > 0.5:
-                speed = 3
-            elif abs(turn) > 0.25:
-                speed = 2
-    
-            if 0 > turn:
-                if (now - last['l']) < MOVE_COMMAND_DELAY:
-                    continue
-    
-                last['l'] = now
-                last_keepalive = now
-                cmd = 'h'
-            else:
-                if (now - last['r']) < MOVE_COMMAND_DELAY:
-                    continue
-    
-                last['r'] = now
-                last_keepalive = now
-                cmd = 'l'
-    
-            rover_send(str(speed))
-            rover_send(str(cmd))
-        # Turns (above) take precedence)
-        elif abs(dir) > 0.1:
-            now = time.time()
-    
-            speed = 1
-    
-            if abs(dir) > 0.75:
-                speed = 4
-            elif abs(dir) > 0.5:
-                speed = 3
-            elif abs(dir) > 0.25:
-                speed = 2
-    
-            if 0 > dir:
-                if (now - last['b']) < MOVE_COMMAND_DELAY:
-                    continue
-    
-                last['b'] = now
-                last_keepalive = now
-                cmd = 'j'
-            else:
-                if (now - last['f']) < MOVE_COMMAND_DELAY:
-                    continue
-    
-                last['f'] = now
-                last_keepalive = now
-                cmd = 'k'
-    
-            rover_send(str(speed))
-            rover_send(str(cmd))
-
+    # forward/reverse
+    elif bready('up', now) or bready('down', now):
+        if getb('up'):
+            rover_cmd('+%s\0+%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
+        else:
+            rover_cmd('-%s\0-%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
+            
 
 for sock in sockets:
     socket_kill(sock)
