@@ -1,5 +1,5 @@
 
-"""Controller code allowing remote, robotic avatar controls via playstation wireless sixaxis controller."""
+"""Client code allowing remote, robotic avatar controls via playstation wireless sixaxis controller."""
 
 import operator
 import re
@@ -10,16 +10,19 @@ import time
 import pygame
 
 
+DEBUG = True
 MAX_NECK_LEFT = 30
 MAX_NECK_RIGHT = 140
-MOVE_COMMAND_DELAY = 0.1
+NECK_INCREMENT_DEGREES = 5
+BUTTON_REPEAT_DELAY = 0.05
+I_DRIVE_REPEAT_DELAY = 0.02
+NAIVE_MOVE_SPEED = '050'
+NAIVE_HALF_SPEED = '025'
 TICK_SLEEP = 10   # milliseconds
 BAIL_TIMEOUT = 500   # milliseconds - how long to wait for network ACK before assuming connection is dead
 I_SLEEP_INIT = 10   # milliseconds - initial value for networking loop sleep...
-NECK_ADDY = ('192.168.20.127', 7777)
+NECK_ADDY = ('192.168.20.126', 7777)
 ROVER_ADDY = ('192.168.20.128', 8888)
-NECK_READY = 'Good to go'
-DEBUG = True
 SIXAXIS_MAP = {
   'buttons': {
     'start':            3,
@@ -49,15 +52,67 @@ SIXAXIS_MAP = {
 }
 
 six = None
-neck = None
-rover = None
-surface = None
-turtle = [400,300]
+last_buttons = {}
+for k in SIXAXIS_MAP['buttons']:
+    last_buttons[k] = 0
+last_axes = {}
+for k in SIXAXIS_MAP['axes']:
+    last_axes[k] = 0
 
+# elements are "name": ((host, port), preshutdown_msg, greeting_msg, keepalive, 'greeting_msg_to_wait_before_sending_our_greeting')
+socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None), 'rover': (ROVER_ADDY, '\\', 'C', None, 'Hello')}
+sockets = {}
+last_keepalive = time.time()
+
+surface = None
+# Unused as of yet...
+turtle_pos = [400,300]
+
+neck_pos = 90   # For display/info purposes only
+
+rover_moving = False   # Detect release of controls and trigger a single explicit 'stop' command immediately
+
+
+def zero_pad(msg, size=3):
+    while len(msg) < size:
+        msg = '0%s' % msg
+
+    return msg
+
+def bready(name, now):
+    if (now - last_buttons[name]) > BUTTON_REPEAT_DELAY and six.get_button(SIXAXIS_MAP['buttons'][name]):
+        last_buttons[name] = now
+
+        return True
+
+    return False
+
+def aready(name, now):
+    if (now - last_axes[name]) > I_DRIVE_REPEAT_DELAY and 0.1 <= abs(geta(name)):
+        last_axes[name] = now
+
+        return True
+
+    return False
+
+def getb(name):
+    return six.get_button(SIXAXIS_MAP['buttons'][name])
+
+def geta(name):
+    return six.get_axis(SIXAXIS_MAP['axes'][name])
+
+def stop_i_drive():
+    global rover_moving
+
+    if rover_moving:
+        rover_moving = False
+
+        rover_cmd('+000\0+000\n')
 
 def debug(msg):
     if DEBUG:
-        print(msg)
+        #sys.stdout.write(msg)
+        print('%s:%s' % (time.time(), msg))
 
 
 def init_pygame():
@@ -82,6 +137,7 @@ def init_pygame():
     if six is None:
         raise Exception('Could not initialize Sixaxis controller!')
 
+    ### Client graphics
     pygame.display.init()
     pygame.display.set_mode((800,600))
     surface = pygame.display.get_surface()
@@ -90,318 +146,237 @@ def init_pygame():
     pygame.display.flip()
 
 
-def socket_kill(sock, preshutdown_msg=None):
-    if not socket is None:
-        if not preshutdown_msg is None:
+def socket_kill(name):
+    if name in sockets and sockets[name] is not None:
+        debug('killing socket %s (fileno: %s)' % (name, sockets[name].fileno()))
+
+        if socket_defs[name][1] is not None:
             try:
-                sock.sendall(preshutdown_msg)
+                debug('Preshutdown msg on "%s" socket: %s' % (name, socket_defs[name][1]))
+
+                sockets[name].sendall(preshutdown_msg)
             except Exception, e:
                 pass
 
         try:
-            sock.shutdown()
+            debug('Sending socket "%s" for shutdown' % name)
+
+            sockets[name].shutdown()
         except Exception, e:
             pass
         finally:
             try:
-                sock.close()
+                debug('Closing socket "%s"' % name)
+
+                sockets[name].close()
             except Exception, e:
                 pass
 
+def socket_reconnect(name):
+    socket_kill(name)
 
-def rover_reconnect(hostport=ROVER_ADDY, recon=False):
-    global rover
+    sockets[name] = create_connection(name)
 
-    socket_kill(rover, '\\')
+    if socket_defs[name][2] is not None:
+        if socket_defs[name][4]is not None:
+            buf = ''
+            start = time.time()
+            while 0 > buf.find(socket_defs[name][4]):
+                try:
+                    buf = '%s%s' % (buf, sockets[name].recv(1024))
+                except Exception, e:
+                    pass
 
-    #rover = socket.socket(socket.AF_INET, socket.SOCK_RAW)
-    rover = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    rover.connect(hostport)
-    rover.setblocking(0)
-    rover.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if (time.time() - start) > BAIL_TIMEOUT:
+                    raise Exception('Could not connect to server for socket "%s"' % name)
 
-    buf = ''
-    start = time.time()
-    i_sleep = I_SLEEP_INIT
+                time.sleep(0.01)
 
-    while 0 > buf.find('Hello'):
-        try:
-            buf = '%s%s' % (buf, rover.recv(1024))
-        except Exception, e:
-            pass
+        socket_send(name, socket_defs[name][2])
 
-        if ((time.time() - start) * 1000) > (BAIL_TIMEOUT * 4):   # Rover takes a while to connect (arduino)
-            break
+def create_connection(name):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-        time.sleep(i_sleep / 1000.0)
-        i_sleep += I_SLEEP_INIT
+    debug('Connecting to socket %s' % name)
+    debug('Connecting to %s:%s' % socket_defs[name][0])
 
-    if 0 > buf.find('Hello'):
-        if not recon:
-            rover_reconnect(hostport, recon=True)
-        else:
-            sys.exit(2)
+    sock.connect(socket_defs[name][0])
 
+    debug('%s:%s - fileno: %s' % (socket_defs[name][0][0], socket_defs[name][0][1], sock.fileno()))
+    debug('setting socket options for %s' % sock.fileno())
 
-def neck_reconnect(hostport=NECK_ADDY, recon=False):
-    global neck
+    sock.setblocking(0)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    socket_kill(neck)
+    return sock
 
-    neck = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    neck.connect(hostport)
-    neck.setblocking(0)
+def socket_send(name, msg, rescue=True):
+    debug('M:%s:%s:%s' % (name, time.time(), msg))
 
-    neck_send('\n', do_reconnect=False)
-
-    if 0 > neck_get().find(NECK_READY):
-        if not recon:
-            neck_reconnect(hostport, recon=True)
-        else:
-            sys.exit(1)
-
-
-def neck_connect():
-    neck_send('\n')
-
-    return neck_get()
-
-
-def neck_cmd(cmd):
-    #neck_get()
-    neck_send(cmd)
-
-
-def rover_send(msg, do_reconnect=True):
-    if rover is None:
-        rover_reconnect()
-
-    sent = 0
+    if sockets[name] is None:
+        socket_reconnect(name)
 
     try:
-        sent = rover.send(msg)
-
+        sockets[name].sendall(msg)
     except Exception, e:
-        if do_reconnect:
-            rover_reconnect()
+        if rescue:
+            socket_reconnect(name)
 
-            sent = rover.send(msg)
+            socket_send(name, msg, rescue=False)
         else:
             raise e
 
-    if sent < len(msg):
-        sys.exit(3)
-
-
-def neck_send(msg, do_reconnect=True):
-    if neck is None:
-        neck_reconnect()
-
-    try:
-        neck.sendall(msg)
-
-    except Exception, e:
-        if do_reconnect:
-            neck_reconnect()
-
-            neck.sendall(msg)
-        else:
-            raise e
-
-
-def neck_get(do_reconnect=True):
-    start = time.time()
-    i_sleep = I_SLEEP_INIT
+def socket_get(name):
     buf = ''
 
-    while 0 > buf.find(NECK_READY):
-        try:
-            buf = '%s%s' % (buf, neck.recv(1024))
-        except Exception, e:
-            pass   # Ignore recv fails on non-blocking socket!
+    try:
+        buf = sockets[name].recv(1024)
+    except Exception, e:
+        pass   # exceptions for nonblocking sockets are expected
 
-        if ((time.time() - start) * 1000) > BAIL_TIMEOUT:
-            break
-
-        time.sleep(i_sleep / 1000.0)
-        i_sleep += I_SLEEP_INIT
-
-    if 0 > buf.find(NECK_READY) and do_reconnect:
-        neck_reconnect()
-
-        return neck_get(do_reconnect=False)
+    debug('socket "%s" received: %s' % (name, buf))
 
     return buf
 
+def socket_cmd(name, cmd):
+    res = socket_get(name)
 
-def move_neck_right(amt=20):
+    socket_send(name, cmd)
+
+    debug('Sent %s to "%s"' % (cmd, name))
+
+    return res
+        
+
+def neck_cmd(cmd, timeout=BAIL_TIMEOUT):
     global neck_pos
 
-    neck_pos += amt
+    change = NECK_INCREMENT_DEGREES
+    if 'a' == cmd:   # left
+        change *= -1
 
-    if neck_pos > MAX_NECK_RIGHT:
-        neck_pos = MAX_NECK_RIGHT
+    last_pos = socket_cmd('neck', cmd)
 
-    neck_cmd(str(neck_pos))
+    if re.search('pos: [0-9]{1,3}\n', last_pos):
+        expr1 = re.compile('.*pos: ', flags=(re.DOTALL|re.MULTILINE))
+        expr2 = re.compile('\n.*', flags=(re.DOTALL|re.MULTILINE))
+        last_pos = re.sub(expr2, '', re.sub(expr1, '', last_pos))
 
-def move_neck_left(amt=20):
-    global neck_pos
+        last_pos = int(last_pos) + change
+        if last_pos < MAX_NECK_LEFT or last_pos > MAX_NECK_RIGHT:
+            last_pos -= change
+        neck_pos = last_pos
 
-    neck_pos -= amt
+        debug('final last neck position (current): %s' % neck_pos)
 
-    if neck_pos < MAX_NECK_LEFT:
-        neck_pos = MAX_NECK_LEFT
 
-    neck_cmd(str(neck_pos))
-  
+def rover_cmd(cmd):
+    socket_cmd('rover', cmd)
 
-#neck_connect()
-#rover_reconnect()
+
+for name in socket_defs:
+    socket_reconnect(name)
 
 init_pygame()
 
-last = {
-  'f': 0,
-  'b': 0,
-  'l': 0,
-  'r': 0,
-}
-
-neck_cmd('90')
-neck_pos = 90
-
-last_keepalive = time.time()
-last_move_cmd = ''
-
 while True:
+    # Frame sleep (remove/play with this to speed up the client overall)
     time.sleep(TICK_SLEEP / 1000.0)
 
+    # Send keepalives...
     if (time.time() - last_keepalive) > 1.0:
-        # Send rover connection keepalive...
-        rover_send(' ')
+        for name in sockets:
+            if socket_defs[name][3] is not None:
+                socket_send(name, socket_defs[name][3])
+
         last_keepalive = time.time()
 
+    # Process events
     pygame.event.pump()
 
-    if 1 == six.get_button(SIXAXIS_MAP['buttons']['playstation']):
-        break   # PS button == exit
-
+    # Frame timestamp
     now = time.time()
 
-    if six.get_button(SIXAXIS_MAP['buttons']['cir']):
-        move_neck_right()
-    elif six.get_button(SIXAXIS_MAP['buttons']['sq']):
-        move_neck_left()
-    else:
-        neck = six.get_axis(SIXAXIS_MAP['axes']['right_x'])
-        if abs(neck) > 0.1:
-            if 0 < neck:
-                # turn head right
-                move = neck_pos + 10
-    
-                if neck > 0.75:
-                    move += 35
-                elif neck > 0.5:
-                    move += 20
-                elif neck > 0.25:
-                    move += 10
-    
-                if move > MAX_NECK_RIGHT:
-                    move = MAX_NECK_RIGHT
-    
-                neck_cmd(str(move))
-                neck_pos = move
+    # Process input
+
+    ### Control mapping:
+    ###
+    ### PS button => quit/exit client
+    ### d pad => naive drive mode for rover (forward/reverse/turn left/turn right)
+    ### bottom triggers => move neck left/right
+    ### analog sticks, Y axes => independent drive (run left & right motors in forward/reverse)
+
+    if bready('playstation', now):
+        break   # PS button == exit/quit
+
+    # neck
+    if bready('l_trigger_bottom', now) or bready('r_trigger_bottom', now):
+        if getb('l_trigger_bottom'):
+            neck_cmd('a')
+        else:
+            neck_cmd('d')
+            
+    # rover - analog sticks (independent drive mode)
+
+   # send explicit stop if sticks are untouched
+    if not aready('left_y', now) and not aready('right_y', now):
+        stop_i_drive()
+
+    # analog sticks take precedence over d-pad...
+    if aready('left_y', now) or aready('right_y', now):
+        left_y = geta('left_y')
+        if abs(left_y) < 0.1:
+            left_y = 0
+
+        right_y = geta('right_y')
+        if abs(right_y) < 0.1:
+            right_y = 0
+
+        cmd_left = '%s\0' % (zero_pad(abs(int(geta('right_y') * 200))))
+        cmd_right = '%s\n' % (zero_pad(abs(int(geta('left_y') * 200))))
+
+        if right_y < 0:
+            cmd_left = '-%s' % cmd_left
+        else:
+            cmd_left = '+%s' % cmd_left
+
+        if left_y < 0:
+            cmd_right = '-%s' % cmd_right
+        else:
+            cmd_right = '+%s' % cmd_right
+
+        cmd = '%s%s' % (cmd_left, cmd_right)
+
+        rover_cmd(cmd)
+
+    # naive drive mode (using d-pad) - turns take precedence (no 'diagonal' controls right now)
+
+    # turn (or "diagonal" (advancing turn))
+    elif bready('left', now) or bready('right', now):
+        if getb('left'):
+            if getb('up'):
+                rover_cmd('+%s\0+%s\n' % (NAIVE_MOVE_SPEED, NAIVE_HALF_SPEED))
+            elif getb('down'):
+                rover_cmd('-%s\0-%s\n' % (NAIVE_MOVE_SPEED, NAIVE_HALF_SPEED))
             else:
-                # turn head left
-                move = neck_pos - 10
-    
-                if neck < -0.75:
-                    move -= 35
-                elif neck < -0.5:
-                    move -= 20
-                elif neck < -0.25:
-                    move -= 10
-    
-                if move < MAX_NECK_LEFT:
-                    move = MAX_NECK_LEFT
-    
-                neck_cmd(str(move))
-                neck_pos = move
-
-    turn = six.get_axis(SIXAXIS_MAP['axes']['left_x'])
-    if six.get_button(SIXAXIS_MAP['buttons']['left']):
-        turn = -0.3
-    elif six.get_button(SIXAXIS_MAP['buttons']['right']):
-        turn = 0.3
-
-    dir = six.get_axis(SIXAXIS_MAP['axes']['left_y']) * -1.0
-    if six.get_button(SIXAXIS_MAP['buttons']['up']):
-        dir = 0.3
-    elif six.get_button(SIXAXIS_MAP['buttons']['down']):
-        dir = -0.3
-
-    if abs(turn) > 0.1:
-        now = time.time()
-
-        speed = 1
-
-        if abs(turn) > 0.75:
-            speed = 4
-        elif abs(turn) > 0.5:
-            speed = 3
-        elif abs(turn) > 0.25:
-            speed = 2
-
-        if 0 > turn:
-            if (now - last['l']) < MOVE_COMMAND_DELAY:
-                continue
-
-            last['l'] = now
-            last_keepalive = now
-            cmd = 'h'
+                rover_cmd('+%s\0-%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
         else:
-            if (now - last['r']) < MOVE_COMMAND_DELAY:
-                continue
+            if getb('up'):
+                rover_cmd('+%s\0+%s\n' % (NAIVE_HALF_SPEED, NAIVE_MOVE_SPEED))
+            elif getb('down'):
+                rover_cmd('-%s\0-%s\n' % (NAIVE_HALF_SPEED, NAIVE_MOVE_SPEED))
+            else:
+                rover_cmd('-%s\0+%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
 
-            last['r'] = now
-            last_keepalive = now
-            cmd = 'l'
-
-        rover_send(str(speed))
-        rover_send(str(cmd))
-    # Turns (above) take precedence)
-    elif abs(dir) > 0.1:
-        now = time.time()
-
-        speed = 1
-
-        if abs(dir) > 0.75:
-            speed = 4
-        elif abs(dir) > 0.5:
-            speed = 3
-        elif abs(dir) > 0.25:
-            speed = 2
-
-        if 0 > dir:
-            if (now - last['b']) < MOVE_COMMAND_DELAY:
-                continue
-
-            last['b'] = now
-            last_keepalive = now
-            cmd = 'j'
+    # forward/reverse
+    elif bready('up', now) or bready('down', now):
+        if getb('up'):
+            rover_cmd('+%s\0+%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
         else:
-            if (now - last['f']) < MOVE_COMMAND_DELAY:
-                continue
+            rover_cmd('-%s\0-%s\n' % (NAIVE_MOVE_SPEED, NAIVE_MOVE_SPEED))
+            
 
-            last['f'] = now
-            last_keepalive = now
-            cmd = 'k'
-
-        rover_send(str(speed))
-        rover_send(str(cmd))
-
-
-for sock in (neck, rover):
+for sock in sockets:
     socket_kill(sock)
 
 sys.exit(0)
