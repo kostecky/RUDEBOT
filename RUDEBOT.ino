@@ -1,9 +1,8 @@
 #include <SPI.h>
-#include <WiFi.h>
-#include <SD.h>
+#include <Ethernet.h>
+//#include <SD.h>
 //#include <Time.h>
 #include "DualMC33926MotorShield.h"
-#include "keys.h"
 
 // Every second we run something
 #define CRON 1000
@@ -42,19 +41,14 @@ const char stop = ' ';
 const char disconnect = '\\';
 
 // String table to save memory
-const char* ramString = "Free SRAM: %d\r\n";
+const char* ramString = "\nFree SRAM: %d\r\n";
 const char* hello = "Hello!\r\n";
-const char* signalString = "Signal: %ld dBm\r\n";
-const char* serverString = "Server status: %d\r\n";
-const char* clientString = "Client status: %d\r\n";
+const char* clientString = "CLIENT CONNECTED\r\n";
 const char* bye = "Bye!\r\n";
 
-boolean alreadyConnected = false;
-byte mac[6];
 unsigned long lastc = millis();
 unsigned long lastcron = millis();
 unsigned long lastbeat = millis();
-unsigned long lastserver = millis();
 int m1MaxCurrent = 0;
 int m2MaxCurrent = 0;
 int speed = 100;
@@ -66,19 +60,22 @@ char cbuf[BUFLEN] = {};
 int bAvail = 0;
 int bRead = 0;
 
-int status = WL_IDLE_STATUS;
+byte mac[] = { 
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(10,11,12,6);
+IPAddress gateway(10,11,12,1);
+IPAddress subnet(255, 255, 255, 0);
+
 // How many milliseconds do we drive for in between commands? 2/3 of a second naturally. This is a good balance between network latency, tcp/ip buffering (even with TCP_NODELAY), and natural controls.
 int thrust_drivetime = 666;
 int yaw_drivetime = 666;
 int drivetime = 666;
 //char beat = '0';
 
+EthernetServer server(8888);
+EthernetClient client;
 
-WiFiClient client;        
-//WiFiClient client2;        
-WiFiServer server(8888);
-
-File logFile;
+//File logFile;
 
 void logger(const char *fmt, ...) {
   char buffer[BUFLEN];
@@ -95,12 +92,16 @@ void logger(const char *fmt, ...) {
 
   Serial.print(timebuffer);
 
-  if (logFile) {
+/*  if (logFile) {
     logFile.print(timebuffer);
     logFile.flush();
-  } else {
+  } 
+*/
+  /*
+  else {
     Serial.println("Log error!");
-  }   
+  } 
+  */  
 }
 
 void setup() {
@@ -118,128 +119,50 @@ void setup() {
   md.init();
 
   // Initialize SD card
-  if (!SD.begin(sdSelect)) {
-    Serial.print("Card failed or not present\r\n");
-  } else {
-    Serial.print("SD initialized\r\n");
-  }
-  logFile = SD.open("RUDEBOT.log", FILE_WRITE);
+//  if (!SD.begin(sdSelect)) {
+//    Serial.print("SD card failed or not present\r\n");
+//  } else {
+//    Serial.print("SD initialized\r\n");
+//  }
+//  logFile = SD.open("RUDEBOT.log", FILE_WRITE);
 
   // RAM free?
   logger(ramString, freeRam());
-  
-  if ((status = WiFi.status()) == WL_NO_SHIELD) {
-    logger("WiFi shield not present\r\n"); 
-    // don't continue:
-    while(true);
-  } 
-
-  // Spit out MAC 
-  /*
-  WiFi.macAddress(mac);
-  Serial.print("MAC: ");
-  Serial.print(mac[5],HEX);
-  Serial.print(":");
-  Serial.print(mac[4],HEX);
-  Serial.print(":");
-  Serial.print(mac[3],HEX);
-  Serial.print(":");
-  Serial.print(mac[2],HEX);
-  Serial.print(":");
-  Serial.print(mac[1],HEX);
-  Serial.print(":");
-  Serial.println(mac[0],HEX);
-  */
-  
-  // Connect
-  connectWifi();
-  
-  // Sync the time - This won't work as the Arduino wifi shield doesn't
-  // support making a client connection at the same time as running a server. One negates
-  // the other for some reason.
-/*
-  if (client.connect("theendless.org", 80)) {
-    Serial.println("connected to server");
-    // Make a HTTP request:
-    client.println("GET /time.php HTTP/1.1");
-    client.println("Host:theendless.org");
-    client.println("Connection: close");
-    client.println();
-  }
-
-  if (client.connected()) {
-    client.flush();
-    client.stop();
-  }
-  client = NULL;
-
-  char response[BUFLEN];
-  int pos = 0;
-  time_t nowTime = 0;
-  // Wait 5 seconds
-  delay(5000);
-  while (timeC.available()) {   
-    char c = timeC.read();
-    Serial.print(c);
     
-    response[pos] = c;
-    if ( c == '\n' ) {
-      response[pos] = NULL;
-      // Now we have a full line, let's look for our TIME
-      if (strstr(response, "TIME:") != NULL) {
-        nowTime = (time_t)atol(&response[5]);
-        break;
-      } else {
-        pos = 0;
-      }
-    }
-  }
-  // Disconnect
-  timeC.stop();
+  // Connect
+  connectEthernet();
   
-  Serial.println("nowTime: " + String(nowTime));
-  
-  // If we got a time, let's sync the Arduino
-  if (nowTime != 0) {
-    setTime(nowTime);
-  }
-*/
-
   // Start server
   server.begin();
 }
 
 void loop() {
-  // Any clients?
-  client = server.available();
-    
-  // Reset already connected if someone dropped
-  if (((alreadyConnected == true) && !client) || 
-      ((alreadyConnected == true) && client && client.status() != 4)) {
-    alreadyConnected = false;
-  }
-
-  // Heartbeat (Every quarter second)  
-/*
-  if ( (millis() - lastbeat) > HEARTBEAT ) {
-    if (alreadyConnected == true) {
-      switch (beat) {
-        case '0':
-          digitalWrite(0, HIGH);
-          beat = '1';
-          break;
-        case '1':
-          digitalWrite(0, LOW);
-          beat = '0';
-          break;
-      }
+  // If we have a client, don't request a new one.
+  // We only want one connection at a time
+  if (!client.connected()) {
+    client.flush();
+    client.stop();
+    //logger("Grabbing a new connection!\r\n");
+    if (client = server.available()) {
+      lastc = millis();
+      client.print(hello);
+      logger(hello);
+      // reset everything
+      md.setSpeeds(0,0);
+      speed = 100;
+      memset(cmdC, NULL, CMDLEN);
+      mode = 'S';
+    }
+  } else {
+    // Disconnect client if no data comes across in CLIENTDEAD ms
+    if (millis() - lastc > CLIENTDEAD) {
+      killClient();
     }
   }
-*/  
+
   // Jobs to run every second
   if ( (millis() - lastcron) > CRON) {
-    logger(ramString, freeRam());
-    printWifiStatus();
+    printStatus();
     int m1 = md.getM1CurrentMilliamps();
     int m2 = md.getM2CurrentMilliamps();
     if ( m1 > m1MaxCurrent) {
@@ -251,67 +174,20 @@ void loop() {
     logger("m1 current (mA)/max: %d / %d\r\n", m1, m1MaxCurrent);
     logger("m2 current (mA)/max: %d / %d\r\n", m2, m2MaxCurrent);
 
-    if (client) {
-      logger(clientString, client.status());
-    }
-    lastcron = millis();
-    
-    // Server alive?
-    if (server.status() != 1) {
-      logger("Server dead: %d\r\n", server.status());      
-      killClient();
-      return;
-    } else {
-      // Log it if it's been a while since we were alive
-      if ( (millis()-lastserver) > 5000 ) {
-        logger("Server dead for %d seconds\r\n", (millis()-lastserver)/1000);
-      }
-      lastserver = millis();
-    }
-  }
-
-  int newstatus = WiFi.status();
-  if (status != newstatus)
-  {
-    logger("WiFi status changed to: %d\r\n", newstatus);
-    status = newstatus;
+    logger("CLIENT STATUS: 0x%X %d\r\n", client.status(), client.connected());
+    lastcron = millis();    
   }
 
   if (client) {
-    // New clients
-    if (!alreadyConnected) {
-      lastc = millis();
-      server.write(hello);
-      // reset everything
-      md.setSpeeds(0,0);
-      speed = 100;
-      memset(cmdC, NULL, 10);
-      alreadyConnected = true;
-      mode = 'S';
-      client.flush();
-      logger(hello);
-    }
-
     // We can switch to "C"lient mode from "S"ocket mode, but not back, unless you reconnect.
-    if ((mode == 'S') && (client.available())) {
+    if ((mode == 'S') && (client.available() > 0)) {
       char c = client.read();
-
-      // Debugging - not needed, maybe for client mode.
-      /*
-      if ( c == NULL ) {
-        logger("'c: NULL'\r\n", c);
-      } else if ( c == '\n' ) {
-        logger("'c: \\n'\r\n", c);        
-      } else {
-        logger("'c: %c'\r\n", c);
-      }
-      */
 
       switch(c) {
         case 'C':
           mode = 'C';
           logger("Changed to client mode\r\n");
-          server.write("C\r\n");
+          client.print("Changed to client mode\r\n");
           drivetime = 666;
           return;
           break;
@@ -366,48 +242,48 @@ void loop() {
       }
       // Time of last command
       lastc = millis();
-      // It's useful for the client to know when
-      // an action has executed.
-      server.write(c);
+      // It's useful for the client to know when an action has executed.
+      client.write(c);
       logger("'%c'\r\n", c);
     }
 
     // Client mode - Independent control of motors
-    if ((mode == 'C') && (bAvail = client.available())) {      
-      // WifiShield libs/firmware only ever return 1 byte if any data is available.
-      // This is very frustrating and shortsighted. Issue has been submitted. How do
-      // we compensate?    
-
-      // Debugging
+    if ((mode == 'C') && (client.available() >= CMDLEN)) {      
+      bAvail = client.available();
       logger("Bytes Available: %d\r\n", bAvail);
       // OK, we probably have at least a command, we only care about the last full command.
       // Defaults to 1000ms timeout waiting on read buffer
       client.setTimeout(10);
-      while (bAvail = client.available()) {
-        bRead = client.readBytesUntil('\n', cmdC, 10);
-        logger("Bytes Read: %d %s %s\r\n", bRead, cmdC, cmdC+5);
-        if ((bRead == 9)) {
+      while (bAvail >= CMDLEN) {
+        bRead = client.readBytesUntil('\n', cmdC, CMDLEN);
+        logger("Bytes Read/Avail: %d/%d %s %s\r\n", bRead, bAvail, cmdC, cmdC+5);
+        if ((bRead == CMDLEN-1)) {
           logger("Good Command\r\n");
           // Most likely a good command
-          cmdC[9] = NULL;
+          cmdC[CMDLEN-1] = NULL;
           // Disconnect?
           if (cmdC[0] == disconnect) {
             killClient();
             return;
           }
-          if ((millis() - lastc) > 1) {
+          // We don't want to stay in this loop longer than 50% of drivetime!
+          if ((millis() - lastc) > (0.1*drivetime)) {
+            logger("Parsing commands for too long: %d ms\r\n", millis() - lastc);
+            // I profiled the flush and it takes on the order of 400ms!!! with a full buffer.
+            // It's quicker to read the commands in as they come and just chuck the ones first
+            // in the queue.
+           // client.flush();
             break;
           }
         } else {
           // else, command is screwed or not all there, read again if there is at least CMDLen left.
           // We're not super-concerned about partial reads. Best be fast and dirty, rather than picky
-          // as so many commands are coming in when in motion.
-          memset(cmdC, NULL, 10);
+          memset(cmdC, NULL, CMDLEN);
         }
-        //bAvail -= bRead;
+        bAvail -= bRead;
       }
             
-      if (bRead) {        
+      if (bRead == CMDLEN-1) {        
         int m1speed = atoi(cmdC);
         int m2speed = atoi(cmdC+5);
         if (m1speed >= 200) {
@@ -424,114 +300,44 @@ void loop() {
         }
           
         // Motors wired in reverse (compensate here)
-        md.setSpeeds(-m1speed, -m2speed);
+        md.setSpeeds(-m1speed, -m2speed);        
         // reset command
-        memset(cmdC, NULL, 10);
+        memset(cmdC, NULL, CMDLEN);
   
         // Time of last command
         lastc = millis();
-        server.write("C\r\n");
+        client.print("C\r\n");
         logger("cmd: %d|%d\r\n", m1speed, m2speed);
       }
-    }    
+    }     
+  } 
 
-    // Stop the cart after no command received for drivetime
-    if (millis() - lastc > drivetime) {
-      md.setSpeeds(0,0);
-    }
-      
-    // Disconnect client if no data comes across in CLIENTDEAD ms
-    if (millis() - lastc > CLIENTDEAD) {
-      killClient();
-    }          
-  } else { 
-    // Safety - client disappears, robot stops. This prevents the robot from trying to kill Anarosa.
-    killClient();
+  // Stop the cart after no command received for drivetime
+  if (millis() - lastc > drivetime) {
+    md.setSpeeds(0,0);
   }
 }
 
 void killClient() {
   md.setSpeeds(0,0);
-  if (client) { 
-    logger(bye);
-    server.write(bye);
-    client.flush();
-    client.stop();
-  }
-  alreadyConnected == false;
+  logger(bye);
+  client.print(bye);
+  client.flush();
+  client.stop();
   // Heart stopped
   //digiitalWrite(0, LOW);
 }
   
-void connectWifi() {
-  while (status != WL_CONNECTED) { 
-    logger("Attempting to connect to SSID: %s\r\n", ssid);
-    status = WiFi.begin(ssid, pass);
-    if (status != WL_CONNECTED) { 
-      logger("Couldn't connect via WiFi, retrying\r\n");
-    } else {
-      printWifiStatus();
-    }
-  } 
+void connectEthernet() {
+  Ethernet.begin(mac, ip, gateway, subnet);
 }
 
-void printWifiStatus() {
-  // Firmware version?
-  // Serial.println("Firmware Version: " + String(WiFi.firmwareVersion()));
-  
-  // How's our power source doing?
-  logger("Battery voltage: %ld\r\n", readVcc());
-  
-  // print the SSID of the network you're attached to:
-  logger("SSID: %s\r\n", WiFi.SSID());
-  
-  // print your WiFi shield's IP address:
-  IPAddress ip = WiFi.localIP();
-  logger("IP Address: %d.%d.%d.%d\r\n", ip[0], ip[1], ip[2], ip[3]);
-
-  // print the received signal strength:
-  logger(signalString, WiFi.RSSI());
-  logger(serverString, server.status());
+void printStatus() {
+//  logger(ramString, freeRam());
 }
 
 int freeRam () {
   extern int __heap_start, *__brkval; 
   int v; 
   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
-}
-
-void stopIfFault()
-{
-  if (md.getFault())
-  {
-    logger("Motor fault\r\n");
-    while(1);
-  }
-}
-
-// Very roughly check on the battery =D
-long readVcc() {
-  // Read 1.1V reference against AVcc
-  // set the reference to Vcc and the measurement to the internal 1.1V reference
-  #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
-    ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
-    ADMUX = _BV(MUX5) | _BV(MUX0);
-  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
-    ADMUX = _BV(MUX3) | _BV(MUX2);
-  #else
-    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-  #endif  
- 
-  delay(2); // Wait for Vref to settle
-  ADCSRA |= _BV(ADSC); // Start conversion
-  while (bit_is_set(ADCSRA,ADSC)); // measuring
- 
-  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH  
-  uint8_t high = ADCH; // unlocks both
- 
-  long result = (high<<8) | low;
- 
-  result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
-  return result; // Vcc in millivolts
 }
