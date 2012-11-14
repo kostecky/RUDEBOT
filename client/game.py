@@ -15,11 +15,11 @@ MAX_NECK_LEFT = 30
 MAX_NECK_RIGHT = 140
 NECK_INCREMENT_DEGREES = 5
 BUTTON_REPEAT_DELAY = 0.05
-I_DRIVE_REPEAT_DELAY = 0.02
-NAIVE_MOVE_SPEED = '050'
-NAIVE_HALF_SPEED = '025'
+I_DRIVE_REPEAT_DELAY = 0.05
+NAIVE_MOVE_SPEED = '100'
+NAIVE_HALF_SPEED = '050'
 TICK_SLEEP = 10   # milliseconds
-BAIL_TIMEOUT = 500   # milliseconds - how long to wait for network ACK before assuming connection is dead
+BAIL_TIMEOUT = 2000   # milliseconds - how long to wait for network ACK before assuming connection is dead
 I_SLEEP_INIT = 10   # milliseconds - initial value for networking loop sleep...
 NECK_ADDY = ('192.168.20.126', 7777)
 ROVER_ADDY = ('192.168.20.128', 8888)
@@ -60,8 +60,9 @@ for k in SIXAXIS_MAP['axes']:
     last_axes[k] = 0
 
 # elements are "name": ((host, port), preshutdown_msg, greeting_msg, keepalive, 'greeting_msg_to_wait_before_sending_our_greeting')
-socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None), 'rover': (ROVER_ADDY, '\\', 'C', None, 'Hello')}
+socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None), 'rover': (ROVER_ADDY, '\\', 'C', None, None)}
 sockets = {}
+last_responses = {}
 last_keepalive = time.time()
 
 surface = None
@@ -74,6 +75,8 @@ rover_moving = False   # Detect release of controls and trigger a single explici
 
 
 def zero_pad(msg, size=3):
+    msg = str(msg)
+
     while len(msg) < size:
         msg = '0%s' % msg
 
@@ -94,6 +97,13 @@ def aready(name, now):
         return True
 
     return False
+
+def dirready(now):
+    if reduce(lambda x,y: x and y, map(lambda x: abs(geta(x)) < 0.1, ('left_y', 'right_y')), True):
+        if reduce(lambda x,y: x and y, map(lambda x: not getb(x), ('up', 'down', 'left', 'right')), True):
+            return False
+
+    return True
 
 def getb(name):
     return six.get_button(SIXAXIS_MAP['buttons'][name])
@@ -138,12 +148,12 @@ def init_pygame():
         raise Exception('Could not initialize Sixaxis controller!')
 
     ### Client graphics
-    pygame.display.init()
-    pygame.display.set_mode((800,600))
-    surface = pygame.display.get_surface()
-    pygame.draw.polygon(surface, pygame.Color('#00FF00FF'), [(400, 300), (500, 300), (450, 213.4)])
-    pygame.draw.polygon(surface, pygame.Color('#FF0000FF'), [(425, 256.7), (475, 256.7), (450, 213.4)])
-    pygame.display.flip()
+    #pygame.display.init()
+    #pygame.display.set_mode((800,600))
+    #surface = pygame.display.get_surface()
+    #pygame.draw.polygon(surface, pygame.Color('#00FF00FF'), [(400, 300), (500, 300), (450, 213.4)])
+    #pygame.draw.polygon(surface, pygame.Color('#FF0000FF'), [(425, 256.7), (475, 256.7), (450, 213.4)])
+    #pygame.display.flip()
 
 
 def socket_kill(name):
@@ -258,6 +268,8 @@ def neck_cmd(cmd, timeout=BAIL_TIMEOUT):
     last_pos = socket_cmd('neck', cmd)
 
     if re.search('pos: [0-9]{1,3}\n', last_pos):
+        last_responses['neck'] = time.time()
+
         expr1 = re.compile('.*pos: ', flags=(re.DOTALL|re.MULTILINE))
         expr2 = re.compile('\n.*', flags=(re.DOTALL|re.MULTILINE))
         last_pos = re.sub(expr2, '', re.sub(expr1, '', last_pos))
@@ -269,13 +281,31 @@ def neck_cmd(cmd, timeout=BAIL_TIMEOUT):
 
         debug('final last neck position (current): %s' % neck_pos)
 
+    elif ((time.time() - last_responses['neck']) * 1000) > timeout:
+        last_responses['neck'] = time.time()
 
-def rover_cmd(cmd):
-    socket_cmd('rover', cmd)
+        socket_reconnect('neck')
+
+        neck_cmd(cmd)
+
+
+def rover_cmd(cmd, timeout=BAIL_TIMEOUT):
+    last_buf = socket_cmd('rover', cmd)
+
+    if 0 <= last_buf.find('C'):
+        last_responses['rover'] = time.time()
+    elif ((time.time() - last_responses['rover']) * 1000) > timeout:
+        last_responses['rover'] = time.time()
+
+        socket_reconnect('rover')
+
+        rover_cmd(cmd)
 
 
 for name in socket_defs:
     socket_reconnect(name)
+    last_responses[name] = time.time()
+
 
 init_pygame()
 
@@ -318,9 +348,11 @@ while True:
             
     # rover - analog sticks (independent drive mode)
 
-   # send explicit stop if sticks are untouched
-    if not aready('left_y', now) and not aready('right_y', now):
+    # send explicit stop if sticks are untouched
+    if not dirready(now):
         stop_i_drive()
+    else:
+        rover_moving = True
 
     # analog sticks take precedence over d-pad...
     if aready('left_y', now) or aready('right_y', now):
@@ -332,18 +364,18 @@ while True:
         if abs(right_y) < 0.1:
             right_y = 0
 
-        cmd_left = '%s\0' % (zero_pad(abs(int(geta('right_y') * 200))))
-        cmd_right = '%s\n' % (zero_pad(abs(int(geta('left_y') * 200))))
+        cmd_left = '%s\0' % (zero_pad(abs(int(geta('right_y') * 150)) + 50))
+        cmd_right = '%s\n' % (zero_pad(abs(int(geta('left_y') * 150)) + 50))
 
         if right_y < 0:
-            cmd_left = '-%s' % cmd_left
-        else:
             cmd_left = '+%s' % cmd_left
+        else:
+            cmd_left = '-%s' % cmd_left
 
         if left_y < 0:
-            cmd_right = '-%s' % cmd_right
-        else:
             cmd_right = '+%s' % cmd_right
+        else:
+            cmd_right = '-%s' % cmd_right
 
         cmd = '%s%s' % (cmd_left, cmd_right)
 
