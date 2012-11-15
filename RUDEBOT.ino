@@ -62,8 +62,8 @@ int bRead = 0;
 
 byte mac[] = { 
   0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip(10,11,12,6);
-IPAddress gateway(10,11,12,1);
+IPAddress ip(192,168,20,128);
+IPAddress gateway(192,168,20,1);
 IPAddress subnet(255, 255, 255, 0);
 
 // How many milliseconds do we drive for in between commands? 2/3 of a second naturally. This is a good balance between network latency, tcp/ip buffering (even with TCP_NODELAY), and natural controls.
@@ -139,13 +139,14 @@ void setup() {
 void loop() {
   // If we have a client, don't request a new one.
   // We only want one connection at a time
+
   if (!client.connected()) {
-    client.flush();
-    client.stop();
+    //client.flush();
+    //client.stop();
     //logger("Grabbing a new connection!\r\n");
     if (client = server.available()) {
       lastc = millis();
-      client.print(hello);
+      server.write(hello);
       logger(hello);
       // reset everything
       md.setSpeeds(0,0);
@@ -155,14 +156,14 @@ void loop() {
     }
   } else {
     // Disconnect client if no data comes across in CLIENTDEAD ms
-    if (millis() - lastc > CLIENTDEAD) {
+    if ((millis() - lastc) > CLIENTDEAD) {
       killClient();
     }
   }
 
   // Jobs to run every second
-  if ( (millis() - lastcron) > CRON) {
-    printStatus();
+  if ((millis() - lastcron) > CRON) {
+    //printStatus();
     int m1 = md.getM1CurrentMilliamps();
     int m2 = md.getM2CurrentMilliamps();
     if ( m1 > m1MaxCurrent) {
@@ -182,12 +183,12 @@ void loop() {
     // We can switch to "C"lient mode from "S"ocket mode, but not back, unless you reconnect.
     if ((mode == 'S') && (client.available() > 0)) {
       char c = client.read();
-
+  
       switch(c) {
         case 'C':
           mode = 'C';
           logger("Changed to client mode\r\n");
-          client.print("Changed to client mode\r\n");
+          server.write("C\r\n");
           drivetime = 666;
           return;
           break;
@@ -243,7 +244,7 @@ void loop() {
       // Time of last command
       lastc = millis();
       // It's useful for the client to know when an action has executed.
-      client.write(c);
+      server.write(c);
       logger("'%c'\r\n", c);
     }
 
@@ -272,13 +273,15 @@ void loop() {
             // I profiled the flush and it takes on the order of 400ms!!! with a full buffer.
             // It's quicker to read the commands in as they come and just chuck the ones first
             // in the queue.
-           // client.flush();
+            client.flush();
+            logger("Flush complete\r\n");
             break;
           }
         } else {
           // else, command is screwed or not all there, read again if there is at least CMDLen left.
           // We're not super-concerned about partial reads. Best be fast and dirty, rather than picky
           memset(cmdC, NULL, CMDLEN);
+          bAvail = client.available();
         }
         bAvail -= bRead;
       }
@@ -306,14 +309,14 @@ void loop() {
   
         // Time of last command
         lastc = millis();
-        client.print("C\r\n");
+        server.write("C\r\n");
         logger("cmd: %d|%d\r\n", m1speed, m2speed);
       }
     }     
   } 
 
   // Stop the cart after no command received for drivetime
-  if (millis() - lastc > drivetime) {
+  if ((millis() - lastc) > drivetime) {
     md.setSpeeds(0,0);
   }
 }
@@ -321,9 +324,12 @@ void loop() {
 void killClient() {
   md.setSpeeds(0,0);
   logger(bye);
-  client.print(bye);
-  client.flush();
-  client.stop();
+  if (client.connected()) {
+    server.write(bye);
+    client.flush();
+    logger("Flush complete\r\n");
+    client.stop();
+  }
   // Heart stopped
   //digiitalWrite(0, LOW);
 }
