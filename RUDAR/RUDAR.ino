@@ -24,7 +24,7 @@ void loop()
     Serial.println(val);  //print sensor value
     delay(25); //sensor be crazy
   } 
-  for(pos = 90; pos>=1; pos-=1)     // goes from 180 degrees to 0 degrees 
+  for(pos = 90; pos>=1; pos-=1)     // goes from 90 degrees to 0 degrees 
   {                                
     myservo.write(pos);              // tell servo to go to position in variable 'pos' 
     delay(15);                       // waits 15ms for the servo to reach the position 
