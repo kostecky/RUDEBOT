@@ -14,11 +14,11 @@ DEBUG = True
 MAX_NECK_LEFT = 30
 MAX_NECK_RIGHT = 140
 NECK_INCREMENT_DEGREES = 5
-BUTTON_REPEAT_DELAY = 0.05
-I_DRIVE_REPEAT_DELAY = 0.05
+BUTTON_REPEAT_DELAY = 0.001
+I_DRIVE_REPEAT_DELAY = 0.001
 NAIVE_MOVE_SPEED = '100'
 NAIVE_HALF_SPEED = '050'
-TICK_SLEEP = 10   # milliseconds
+TICK_SLEEP = 1   # milliseconds
 BAIL_TIMEOUT = 2000   # milliseconds - how long to wait for network ACK before assuming connection is dead
 I_SLEEP_INIT = 10   # milliseconds - initial value for networking loop sleep...
 NECK_ADDY = ('192.168.20.126', 7777)
@@ -59,8 +59,11 @@ last_axes = {}
 for k in SIXAXIS_MAP['axes']:
     last_axes[k] = 0
 
-# elements are "name": ((host, port), preshutdown_msg, greeting_msg, keepalive, 'greeting_msg_to_wait_before_sending_our_greeting')
-socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None), 'rover': (ROVER_ADDY, '\\', 'C', None, None)}
+# elements are "name": ((host, port), preshutdown_msg, greeting_msg, keepalive, 'greeting_msg_to_wait_before_sending_our_greeting', 'greeting_to_wait_for_after_sending_our_greeting, cmd_ack, initial_cmd)
+# WARNING: If cmd_ack is not None, you MUST also specify initial_cmd!
+#socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None, None, None, None), 'rover': (ROVER_ADDY, '\\', 'C', '+000\0+000\n', None, 'C', 'C', '+000\0+000\n')}
+#socket_defs = {'neck': (NECK_ADDY, None, ' ', ' ', None, None, None, None)}
+socket_defs = {'rover': (ROVER_ADDY, '\\', 'C', '+000\0+000\n', None, 'C', 'C', '+000\0+000\n')}
 sockets = {}
 last_responses = {}
 last_keepalive = time.time()
@@ -70,8 +73,14 @@ surface = None
 turtle_pos = [400,300]
 
 neck_pos = 90   # For display/info purposes only
+neck_buffer = ''
 
 rover_moving = False   # Detect release of controls and trigger a single explicit 'stop' command immediately
+
+
+for name, defn in socket_defs.items():
+    if defn[6] is None and not defn[7] is None:
+        raise Exception('You MUST specify an initial_cmd if you specify cmd_ack!')
 
 
 def zero_pad(msg, size=3):
@@ -164,7 +173,7 @@ def socket_kill(name):
             try:
                 debug('Preshutdown msg on "%s" socket: %s' % (name, socket_defs[name][1]))
 
-                sockets[name].sendall(preshutdown_msg)
+                sockets_send(name, msg, rescue=False, reconnect=False)
             except Exception, e:
                 pass
 
@@ -182,6 +191,22 @@ def socket_kill(name):
             except Exception, e:
                 pass
 
+def socket_wait_for(name, msg, buf=''):
+    start = time.time()
+    while 0 > buf.find(msg):
+        #debug('looping in socket_wait_for')
+        try:
+            buf = '%s%s' % (buf, sockets[name].recv(1))   # Waited messages are sucked down one byte at a time!
+        except Exception, e:
+            pass
+
+        if ((time.time() - start) * 1000) > BAIL_TIMEOUT:
+            raise Exception('Could not connect to server for socket "%s", buf: "%s"' % (name, buf))
+
+        time.sleep(0.001)
+
+    return buf
+
 def socket_reconnect(name):
     socket_kill(name)
 
@@ -189,20 +214,25 @@ def socket_reconnect(name):
 
     if socket_defs[name][2] is not None:
         if socket_defs[name][4]is not None:
-            buf = ''
-            start = time.time()
-            while 0 > buf.find(socket_defs[name][4]):
-                try:
-                    buf = '%s%s' % (buf, sockets[name].recv(1024))
-                except Exception, e:
-                    pass
-
-                if (time.time() - start) > BAIL_TIMEOUT:
-                    raise Exception('Could not connect to server for socket "%s"' % name)
-
-                time.sleep(0.01)
+            try:
+                socket_wait_for(name, socket_defs[name][4])
+            except Exception, e:
+                print('Could not reconnect to %s' % name)
+                sys.exit(1)
 
         socket_send(name, socket_defs[name][2])
+
+        if socket_defs[name][5] is not None:
+            try:
+                socket_wait_for(name, socket_defs[name][5])
+            except Exception, e:
+                # If there's no initial command, we can't just assume a clean reconnect, so fail...
+                if socket_defs[name][7] is None:
+                    print('Could not reconnect to %s' % name)
+                    sys.exit(2)
+
+    if socket_defs[name][7] is not None:
+        socket_send(name, socket_defs[name][7], rescue=False)
 
 def create_connection(name):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -220,14 +250,25 @@ def create_connection(name):
 
     return sock
 
-def socket_send(name, msg, rescue=True):
+def socket_send(name, msg, rescue=True, reconnect=True):
     debug('M:%s:%s:%s' % (name, time.time(), msg))
 
-    if sockets[name] is None:
+    if len(msg) > 1024:
+        raise Exception('Sorry, you tried to send more than 1kb through a socket, this is unsupported (yeah it IS dumb, but the implementation is fast ;).')
+
+    if sockets[name] is None and reconnect:
         socket_reconnect(name)
 
     try:
-        sockets[name].sendall(msg)
+        start = time.time()
+        sent = 0
+        while sent < len(msg):
+            #debug('looping in socket_send')
+            if 0 < sent:
+                time.sleep(0.001)    # 10ms wait for socket overhead if we can't send immediately
+                if ((time.time() - start) * 1000) > BAIL_TIMEOUT:
+                    raise Exception('Sending timeout!')
+            sent += sockets[name].send(msg[sent:])
     except Exception, e:
         if rescue:
             socket_reconnect(name)
@@ -251,6 +292,10 @@ def socket_get(name):
 def socket_cmd(name, cmd):
     res = socket_get(name)
 
+    if socket_defs[name][6] is not None and 0 > res.find(socket_defs[name][6]):
+        # Wait for the last 
+        res = socket_wait_for(name, socket_defs[name][6], res)
+
     socket_send(name, cmd)
 
     debug('Sent %s to "%s"' % (cmd, name))
@@ -259,22 +304,23 @@ def socket_cmd(name, cmd):
         
 
 def neck_cmd(cmd, timeout=BAIL_TIMEOUT):
-    global neck_pos
+    global neck_pos, neck_buffer
 
     change = NECK_INCREMENT_DEGREES
     if 'a' == cmd:   # left
         change *= -1
 
-    last_pos = socket_cmd('neck', cmd)
+    last_msg = socket_cmd('neck', cmd)
+    neck_buffer = '%s%s' % (neck_buffer, last_msg)
 
-    if re.search('pos: [0-9]{1,3}\n', last_pos):
+    if re.search('pos: [0-9]{1,3}\n', neck_buffer):
         last_responses['neck'] = time.time()
 
         expr1 = re.compile('.*pos: ', flags=(re.DOTALL|re.MULTILINE))
         expr2 = re.compile('\n.*', flags=(re.DOTALL|re.MULTILINE))
-        last_pos = re.sub(expr2, '', re.sub(expr1, '', last_pos))
+        neck_buffer = re.sub(expr2, '', re.sub(expr1, '', neck_buffer))
 
-        last_pos = int(last_pos) + change
+        last_post = int(neck_buffer) + change
         if last_pos < MAX_NECK_LEFT or last_pos > MAX_NECK_RIGHT:
             last_pos -= change
         neck_pos = last_pos
@@ -289,17 +335,8 @@ def neck_cmd(cmd, timeout=BAIL_TIMEOUT):
         neck_cmd(cmd)
 
 
-def rover_cmd(cmd, timeout=BAIL_TIMEOUT):
-    last_buf = socket_cmd('rover', cmd)
-
-    if 0 <= last_buf.find('C'):
-        last_responses['rover'] = time.time()
-    elif ((time.time() - last_responses['rover']) * 1000) > timeout:
-        last_responses['rover'] = time.time()
-
-        socket_reconnect('rover')
-
-        rover_cmd(cmd)
+def rover_cmd(cmd):
+    socket_cmd('rover', cmd)
 
 
 for name in socket_defs:
